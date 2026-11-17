@@ -25,6 +25,7 @@ import email.utils as email_utils
 from email.policy import SMTP as SMTP_POLICY
 import ssl
 import sys
+import time
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -357,6 +358,33 @@ def load_env(path: Path) -> dict[str, str]:
     return env
 
 
+def extract_toc(markdown: str) -> str:
+    """Return only the table-of-contents block (headline list) of a digest.
+
+    The outbound SMTP gateway scores long bodies as spam: measured on this
+    account, a ~4 KB body passes while an 11 KB body is consistently refused
+    with ``554 Reject by content spam`` (the same text sent with every URL
+    stripped is still refused, so length - not link count or wording - is the
+    trigger). The e-mail body therefore carries only the headline list, and
+    the complete digest travels as an attachment.
+    """
+    lines = markdown.splitlines()
+    cuts = [i for i, line in enumerate(lines) if line.strip() == "---"]
+    if len(cuts) < 2:
+        return markdown
+    toc = "\n".join(lines[: cuts[1]])
+    # The TOC links to in-document anchors that live in the body we just cut
+    # away, so resolve them against the anchors of the complete digest;
+    # otherwise every headline would be a dead link in the e-mail.
+    anchors = _collect_anchors(lines)
+    toc = re.sub(
+        r"\]\(#([^)]+)\)",
+        lambda m: "](" + anchors.get(m.group(1), "#" + m.group(1)) + ")",
+        toc,
+    )
+    return toc
+
+
 def markdown_to_plain(markdown: str) -> str:
     """Strip Markdown/HTML decoration so the digest reads as plain text.
 
@@ -458,12 +486,12 @@ def main() -> int:
         markdown_path = Path(args.markdown)
         if markdown_path.exists():
             markdown_text = markdown_path.read_text(encoding="utf-8")
-            html_body = render_digest_html(markdown_text)
-            # Keep the plain-text part as rich as the HTML part: a 1 KB text
-            # body next to a 70 KB HTML body is what mail filters score down.
-            header = body.split("本期条目")[0].rstrip() if "本期条目" in body else body.rstrip()
+            # Body = headline list only; the full digest is attached separately.
+            # See extract_toc() for the measured length limit on this gateway.
+            toc_markdown = extract_toc(markdown_text)
+            html_body = render_digest_html(toc_markdown)
             plain_body = (
-                f"{header}\n\n{markdown_to_plain(markdown_text)}\n\n"
+                f"{markdown_to_plain(toc_markdown)}\n\n"
                 "完整日报见附件（Markdown）。\n"
             )
 
@@ -514,13 +542,42 @@ def main() -> int:
         print(f"send_mail: DKIM key not found at {dkim_privkey_path}, sending unsigned", file=sys.stderr)
         dkim_state = "missing-key"
 
-    try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(host, port, context=context, timeout=60) as server:
-            server.login(user, password)
-            server.sendmail(user, [r.strip() for r in recipients.split(",") if r.strip()], raw)
-    except Exception as exc:  # noqa: BLE001 - report every failure to the caller
-        print(f"send_mail: send failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    # 到 smtp.qiye.aliyun.com:465 的 TLS 握手偶尔会被 Clash/TUN 代理打断
+    # （SSLEOFError: UNEXPECTED_EOF_WHILE_READING）。实测同一分钟内重连即可成功，
+    # 所以这里做有限次重试：每次重新建连+登录，指数退避，避免一封偶发失败就整天空跑。
+    recipients_list = [r.strip() for r in recipients.split(",") if r.strip()]
+    max_attempts = 6
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(host, port, context=context, timeout=60) as server:
+                server.login(user, password)
+                server.sendmail(user, recipients_list, raw)
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001 - retry then report
+            last_exc = exc
+            print(
+                f"send_mail: attempt {attempt}/{max_attempts} failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            # 554 "Reject by content spam" is deterministic: the identical bytes
+            # are refused every time, so retrying only wastes a minute and
+            # further damages the sender reputation.
+            if isinstance(exc, smtplib.SMTPDataError) and exc.smtp_code == 554:
+                print("send_mail: content filter rejection is not retryable", file=sys.stderr)
+                break
+            if attempt < max_attempts:
+                time.sleep(min(5 * attempt, 20))
+
+    if last_exc is not None:
+        print(
+            f"send_mail: send failed after {max_attempts} attempts: "
+            f"{type(last_exc).__name__}: {last_exc}",
+            file=sys.stderr,
+        )
         return 1
 
     print(
