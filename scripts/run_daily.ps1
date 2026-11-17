@@ -274,7 +274,6 @@ if ($NoEmail) {
         $bodyFile = Join-Path $logDir ("mail-body-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
         $bodyText = $sb.ToString()
         [System.IO.File]::WriteAllText($bodyFile, $bodyText, (New-Object System.Text.UTF8Encoding($false)))
-        [System.IO.File]::WriteAllText($bodyFile, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
         try {
             $mailArgs = @(
                 'run', 'python', (Join-Path $HorizonHome 'scripts\send_mail.py'),
@@ -303,6 +302,14 @@ if ($NoEmail) {
             }
             $emailSent = $true
             $emailNote = "sent to $smtpTo"
+            # 发送成功后清掉桌面上旧的失败通知，避免用户被过期提示误导。
+            try {
+                $desktopDir = [Environment]::GetFolderPath('Desktop')
+                if ($desktopDir) {
+                    Get-ChildItem -LiteralPath $desktopDir -Filter 'Horizon-邮件发送失败-*.txt' -ErrorAction SilentlyContinue |
+                        Remove-Item -Force -ErrorAction SilentlyContinue
+                }
+            } catch { }
         } finally {
             # 正文副本保留在 data\logs\mail-body-*.txt，临时文件不再需要。
             Remove-Item -LiteralPath ($bodyFile + '.tmp') -Force -ErrorAction SilentlyContinue
@@ -320,6 +327,29 @@ if ($NoEmail) {
             $detail = "$detail | server: $([System.Text.Encoding]::UTF8.GetString($ex.Response))"
         }
         $emailNote = "send failed: $detail"
+        # 邮件是唯一的通知渠道，静默失败用户无从得知：在桌面留一个显眼的
+        # 失败通知，并给出手动补发命令。
+        try {
+            $desktopDir = [Environment]::GetFolderPath('Desktop')
+            if ($desktopDir) {
+                $flagPath = Join-Path $desktopDir ("Horizon-邮件发送失败-{0}.txt" -f $utcDate)
+                $flagText = @(
+                    "Horizon 日报邮件发送失败",
+                    "",
+                    "日期：$utcDate",
+                    "时间：$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+                    "收件人：$smtpTo",
+                    "原因：$detail",
+                    "",
+                    "日报本身已正常生成：",
+                    "$summaryFile",
+                    "",
+                    "手动补发命令：",
+                    "powershell -NoProfile -ExecutionPolicy Bypass -File `"$HorizonHome\scriptsun_daily.ps1`" -MailOnly"
+                ) -join "`r`n"
+                [System.IO.File]::WriteAllText($flagPath, $flagText, (New-Object System.Text.UTF8Encoding($false)))
+            }
+        } catch { }
     }
 }
 "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] email: $emailNote" | Tee-Object -FilePath $logFile -Append

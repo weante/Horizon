@@ -494,6 +494,15 @@ def main() -> int:
                 f"{markdown_to_plain(toc_markdown)}\n\n"
                 "完整日报见附件（Markdown）。\n"
             )
+            # Guard rail: the gateway refuses large bodies. Today the TOC is a
+            # few KB, but a digest with many items could grow past the limit,
+            # so surface it early instead of failing silently at send time.
+            if len(html_body.encode()) > 12000 or len(plain_body.encode()) > 4000:
+                print(
+                    f"send_mail: warning: body is large (html={len(html_body.encode())}B,"
+                    f" plain={len(plain_body.encode())}B) - gateway may reject it",
+                    file=sys.stderr,
+                )
 
     if html_body:
         # multipart/alternative：纯文本兜底 + HTML 正文，Outlook 优先显示 HTML。
