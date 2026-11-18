@@ -43,6 +43,14 @@ $logFile = Join-Path $logDir ("{0}-{1}.log" -f $logPrefix, (Get-Date -Format 'yy
 $env:UV_CACHE_DIR = Join-Path $env:LOCALAPPDATA 'uv\cache'
 # Python 在非 TTY 下默认块缓冲，日志要等到 8KB 才落盘，出错时看不到进度。
 $env:PYTHONUNBUFFERED = '1'
+# 让 Python 按 UTF-8 写 stdout/stderr，否则中文与 emoji 会按 GBK 输出成乱码。
+$env:PYTHONIOENCODING = 'utf-8'
+# 接收端也按 UTF-8 解码，才能还原上面写出的中文。
+$prevConsoleEncoding = $null
+try {
+    $prevConsoleEncoding = [Console]::OutputEncoding
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+} catch { }
 # ---- MiniMax 配额预检 ------------------------------------------------------------
 # 若套餐用量已耗尽（HTTP 429 + 错误码 2056），直接中止，避免跑完整管线后
 # 把当天已有的完整日报覆盖成"增强失败"的残缺版。其它错误（超时、网络抖动）
@@ -114,14 +122,13 @@ if ($MailOnly) {
     }
 
     # Horizon 往 stderr 写日志时，PowerShell 5.1 会把它包装成 ErrorRecord
-    # （NativeCommandError）并在控制台打出整段红色错误。计划任务补跑时这会让
-    # 窗口弹出打扰用户，用户关掉窗口还会连带杀掉 Horizon 进程（0xC000013A）。
-    # 这里临时静默错误流，并把每条记录转成纯文本，日志内容一条不丢。
-    $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = 'SilentlyContinue'
-    & $uv run horizon --hours $Hours *>&1 | Tee-Object -FilePath $logFile -Append
+    # （NativeCommandError）并在控制台打出整段红色错误。
+    # 2>&1 合并两条流后用 ForEach-Object 逐条转成纯文本，既保留内容
+    # 又不会冒出 NativeCommandError。
+    # 注意：不能用 $ErrorActionPreference='SilentlyContinue' —— 它会把 stderr 整个吞掉，
+    # 日志里只剩下脚本自己写的几行（2026-11-18 踩过这个坑）。
+    & $uv run horizon --hours $Hours 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $logFile -Append
     $code = $LASTEXITCODE
-    $ErrorActionPreference = $prevEap
 }
 
 # ---- 运行后校验：增强失败过多则回滚 -------------------------------------------------
@@ -297,13 +304,10 @@ if ($NoEmail) {
                 $mailArgs += @('--markdown', $summaryFile)
                 $mailArgs += @('--attach', $summaryFile)
             }
-            # 同上的 stderr 处理：send_mail.py 把失败原因写 stderr，若不静默就会
-            # 冒出 NativeCommandError 红色错误。
-            $prevEap = $ErrorActionPreference
-            $ErrorActionPreference = 'SilentlyContinue'
-            $mailOutput = & $uv @mailArgs *>&1
+            # 同上的 stderr 处理：2>&1 合并后逐条转字符串，既保留内容又不会冒出
+            # NativeCommandError 红色错误。不能用 SilentlyContinue，它会把 stderr 吞掉。
+            $mailOutput = & $uv @mailArgs 2>&1 | ForEach-Object { "$_" }
             $mailExit = $LASTEXITCODE
-            $ErrorActionPreference = $prevEap
             if ($mailExit -ne 0) {
                 throw ("send_mail.py failed (exit {0}): {1}" -f $mailExit, ($mailOutput -join ' '))
             }
@@ -369,4 +373,7 @@ if ($NoEmail) {
 }
 "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] email: $emailNote" | Tee-Object -FilePath $logFile -Append
 
+if ($prevConsoleEncoding) {
+    try { [Console]::OutputEncoding = $prevConsoleEncoding } catch { }
+}
 exit $code
